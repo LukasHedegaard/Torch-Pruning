@@ -387,64 +387,38 @@ class ParameterPruner(BasePruningFunc):
 class MultiheadAttentionPruner(BasePruningFunc):
     TARGET_MODULES = ops.TORCH_MHA
 
-    def check(self, layer, idxs, to_output):
-        super().check(layer, idxs, to_output)
-        assert (layer.embed_dim - len(idxs)) % layer.num_heads == 0, "embed_dim (%d) of MultiheadAttention after pruning must divide evenly by `num_heads` (%d)" % (layer.embed_dim, layer.num_heads)
+    # The heads are applied to the embed_dim, which is the inner dimensionality
+    # prior to scaled dot-product attention - not the in or output dimensionality of the MHA.
+    # def check(self, layer, idxs, to_output):
+    #     super().check(layer, idxs, to_output)
+    #     ...
 
     def prune_out_channels(self, layer, idxs: list) -> nn.Module:
+        layer.out_proj = prune_linear_out_channels(layer.out_proj, idxs)
+        return layer
+    
+    def prune_in_channels(self, layer, idxs: list) -> nn.Module:
         keep_idxs = list(set(range(layer.embed_dim)) - set(idxs))
         keep_idxs.sort()
-
-
-        if layer.q_proj_weight is not None:
-            layer.q_proj_weight = self._prune_parameter_and_grad(layer.q_proj_weight, keep_idxs, 0)
-        if layer.k_proj_weight is not None:
-            layer.q_proj_weight = self._prune_parameter_and_grad(layer.k_proj_weight, keep_idxs, 0)
-        if layer.v_proj_weight is not None:
-            layer.v_proj_weight = self._prune_parameter_and_grad(layer.v_proj_weight, keep_idxs, 0)
-
-
-        pruning_idxs_repeated = idxs + \
-            [i+layer.embed_dim for i in idxs] + \
-            [i+2*layer.embed_dim for i in idxs]
-        keep_idxs_3x_repeated = list(
-            set(range(3*layer.embed_dim)) - set(pruning_idxs_repeated))
-        keep_idxs_3x_repeated.sort()
-        if layer.in_proj_weight is not None:
-            layer.in_proj_weight = self._prune_parameter_and_grad(layer.in_proj_weight, keep_idxs_3x_repeated, 0)
+        if layer._qkv_same_embed_dim:
             layer.in_proj_weight = self._prune_parameter_and_grad(layer.in_proj_weight, keep_idxs, 1)
-        if layer.in_proj_bias is not None:
-            layer.in_proj_bias = self._prune_parameter_and_grad(layer.in_proj_bias, keep_idxs_3x_repeated, 0)
-
-        if layer.bias_k is not None:
-            layer.bias_k = self._prune_parameter_and_grad(layer.bias_k, keep_idxs, 2)
-        if layer.bias_v is not None:
-            layer.bias_v = self._prune_parameter_and_grad(layer.bias_v, keep_idxs, 2)
-
-        linear = layer.out_proj
-        keep_idxs = list(set(range(linear.out_features)) - set(idxs))
-        keep_idxs.sort()
-        linear.out_features = linear.out_features-len(idxs)
-        linear.weight = self._prune_parameter_and_grad(linear.weight, keep_idxs, 0)
-        if linear.bias is not None:
-            linear.bias = self._prune_parameter_and_grad(linear.bias, keep_idxs, 0)
-        keep_idxs = list(set(range(linear.in_features)) - set(idxs))
-        keep_idxs.sort()
-        linear.in_features = linear.in_features-len(idxs)
-        linear.weight = self._prune_parameter_and_grad(linear.weight, keep_idxs, 1)
-        layer.embed_dim = layer.embed_dim - len(idxs)
-        layer.head_dim = layer.embed_dim // layer.num_heads
-        layer.kdim = layer.embed_dim
-        layer.vdim = layer.embed_dim
+        else:
+            # We can't assume that idxs match across Q, K, and V when they don't have same embed_dim.
+            # For instance, this isn't true in Transformer Decoders.
+            # To support truly flexible pruning, we would need to split `prune_in_channels`
+            # into `prune_k_channel`, `prune_q_channel`, and `prune_v_channel`.
+            # Here, we'll assume that the q_proj handles the main input, which needs pruning.
+            layer.q_proj_weight = self._prune_parameter_and_grad(layer.q_proj_weight, keep_idxs, 1)
         return layer
 
-    prune_in_channels = prune_out_channels
-
     def get_out_channels(self, layer):
-        return layer.embed_dim
+        return layer.out_proj.out_features
 
     def get_in_channels(self, layer):
-        return self.get_out_channels(layer)
+        if layer._qkv_same_embed_dim:
+            return layer.in_proj_weight.shape[1]
+        else:
+            return layer.q_proj_weight.shape[1]
 
 PrunerBox = {
     ops.OPTYPE.CONV: ConvPruner(),
